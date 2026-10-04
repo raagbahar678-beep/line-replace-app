@@ -702,7 +702,7 @@ class Engine(
             if (r2s.n > 0) {
                 val c = env.openChannel()
                 chn = c
-                rr = RR(c, 0L, s2.idx, s2.k) { }
+                rr = RR(c, c.size(), s2.idx, s2.k) { }
             }
             val buf = ByteArray(1 shl 20)
             var line = 0
