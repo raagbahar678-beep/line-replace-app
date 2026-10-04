@@ -8,82 +8,231 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.view.KeyEvent
+import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.io.OutputStreamWriter
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.text.SimpleDateFormat
 import java.util.ArrayList
+import java.util.BitSet
 import java.util.Date
+import java.util.HashMap
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
-// ---------------------------------------------------------------
-// Data holders
-// ---------------------------------------------------------------
-class PyEx(msg: String) : Exception(msg)
+// ===============================================================
+// Small helpers / data holders (primitive growable arrays = fast, low memory)
+// ===============================================================
+private const val MASK = 0xFFFFFFFFL
 
-class Rep(val start1: Int, val end1: Int, val ranges: List<Pair<Int, Int>>)
+class CancelEx : Exception("Cancelled")
 
-class VR(
-    val num: Int,
-    val lineNum: Int,
-    val file1Range: String,
-    val file2Ranges: String,
-    val status: String,
-    val errors: List<String>,
-    val warnings: List<String>
-)
-
-class PR(val num: Int, val file1Range: String, val inserted: Int, val status: String)
-
-fun pyInt(s: String): Int {
-    val t = s.trim()
-    val v = t.toIntOrNull()
-    if (v == null) throw PyEx("invalid literal for int() with base 10: '" + s + "'")
-    return v
-}
-
-fun splitLines(text: String): List<String> {
-    val t = text.replace("\r\n", "\n").replace("\r", "\n")
-    val r = ArrayList<String>()
-    var s = 0
-    var i = 0
-    while (i < t.length) {
-        if (t[i] == '\n') {
-            r.add(t.substring(s, i + 1))
-            s = i + 1
-        }
-        i++
+class IntList {
+    var a = IntArray(1024)
+    var n = 0
+    fun add(v: Int) {
+        if (n == a.size) a = a.copyOf(n * 2)
+        a[n] = v
+        n++
     }
-    if (s < t.length) r.add(t.substring(s))
-    return r
+    operator fun get(i: Int): Int = a[i]
 }
 
-fun rangeStr(a: Int, b: Int): String {
+class LongList {
+    var a = LongArray(1024)
+    var n = 0
+    fun add(v: Long) {
+        if (n == a.size) a = a.copyOf(n * 2)
+        a[n] = v
+        n++
+    }
+    operator fun get(i: Int): Long = a[i]
+}
+
+class FR(val f1: String, val f2: String, val errors: ArrayList<String>)
+
+class Scan(val lines: Int, val idx: LongList, val k: Int)
+
+class Holder {
+    @Volatile var v: Scan? = null
+    @Volatile var err: Throwable? = null
+}
+
+class Stats {
+    var processed = 0
+    var inserted = 0L
+    var outLines = 0L
+}
+
+fun rangeStr(a: Long, b: Long): String {
     return if (a != b) "$a-$b" else a.toString()
 }
 
-// ---------------------------------------------------------------
-// The engine: exact port of the Python script
-// ---------------------------------------------------------------
-class Engine(
-    private val flushCb: (String) -> Unit,
-    private val writer: (String, String) -> Unit
+fun clampI(v: Long): Int {
+    return if (v > Int.MAX_VALUE) Int.MAX_VALUE else if (v < Int.MIN_VALUE) Int.MIN_VALUE else v.toInt()
+}
+
+interface Env {
+    fun openIn(which: Int): InputStream          // 1 = file1, 2 = file2, 3 = map
+    fun size(which: Int): Long
+    fun openChannel(): FileChannel               // random access to file2
+    fun openOut(name: String): OutputStream
+    fun discard(name: String)
+    fun release()
+}
+
+// Buffered output (1 MB)
+class OutBuf(private val os: OutputStream) {
+    private val b = ByteArray(1 shl 20)
+    private var n = 0
+    var total = 0L
+
+    fun put(v: Int) {
+        if (n == b.size) flush()
+        b[n] = v.toByte()
+        n++
+    }
+
+    fun flush() {
+        if (n > 0) {
+            os.write(b, 0, n)
+            total += n
+            n = 0
+        }
+    }
+}
+
+// Random-access reader for file2: sparse line index + sliding window
+class RR(
+    private val ch: FileChannel,
+    private val size: Long,
+    private val idx: LongList,
+    private val kk: Int,
+    private val onLoad: () -> Unit
 ) {
+    private val win = ByteArray(1 shl 20)
+    private var wStart = 0L
+    private var wLen = 0
+    private var nextLoad = 32768
+
+    private fun load(pos: Long) {
+        nextLoad = if (wLen > 0 && pos == wStart + wLen) minOf(1 shl 20, nextLoad * 2) else 32768
+        val want = minOf(nextLoad.toLong(), size - pos).toInt()
+        val bb = ByteBuffer.wrap(win, 0, want)
+        var got = 0
+        while (got < want) {
+            val r = ch.read(bb, pos + got)
+            if (r < 0) break
+            got += r
+        }
+        wStart = pos
+        wLen = got
+        onLoad()
+    }
+
+    // copies file2 lines s..e (1-based, inclusive) to ob, line endings normalised to \n
+    fun copy(s: Int, e: Int, ob: OutBuf) {
+        val m = (s - 1) / kk
+        var pos = idx[m]
+        var line = 1 + m * kk
+        var prevCR = false
+        var fin = false
+        while (!fin && pos < size) {
+            if (pos < wStart || pos >= wStart + wLen) {
+                load(pos)
+                if (wLen == 0) break
+            }
+            var j = (pos - wStart).toInt()
+            while (j < wLen) {
+                val b = win[j].toInt()
+                j++
+                if (prevCR) {
+                    prevCR = false
+                    if (b == 10) continue
+                }
+                if (b == 10 || b == 13) {
+                    if (line >= s) ob.put(10)
+                    if (line == e) {
+                        fin = true
+                        break
+                    }
+                    line++
+                    if (b == 13) prevCR = true
+                } else if (line >= s) {
+                    ob.put(b)
+                }
+            }
+            pos = wStart + j
+        }
+    }
+}
+
+// ===============================================================
+// The engine: streaming port of the Python script
+// ===============================================================
+class Engine(
+    private val env: Env,
+    private val tmp: File,
+    private val say: (String) -> Unit,
+    private val prog: (String, Int) -> Unit
+) {
+    @Volatile var cancel = false
+
+    private val eq = "=".repeat(60)
+    private val dash = "-".repeat(60)
     private val sb = StringBuilder()
     private var cnt = 0
+    private var lastTick = 0L
+    private val scanDone = AtomicLong()
+
+    // per-mapping compact storage
+    private val mSt = IntList()
+    private val mEn = IntList()
+    private val mLine = IntList()
+    private val mRs = IntList()
+    private val r2s = IntList()
+    private val r2e = IntList()
+    private val fails = HashMap<Int, FR>()
+    private val failedBits = BitSet()
+    private var failedCount = 0
+    private var totalMappings = 0
+    private var l1 = 0
+    private var l2 = 0
+    private var tokOk = true
+    private var tmpT = LongArray(1024)
+    private var tmpN = 0
+    private var procDone = 0L
+    private var procTotal = 0L
+
+    private fun chk() {
+        if (cancel) throw CancelEx()
+    }
 
     private fun fl() {
         if (sb.isNotEmpty()) {
             val t = sb.toString()
             sb.setLength(0)
-            flushCb(t)
+            say(t)
         }
     }
 
@@ -93,274 +242,695 @@ class Engine(
         if (cnt % 25 == 0) fl()
     }
 
-    fun finish() {
-        fl()
+    private fun tick(stage: String, done: Long, total: Long) {
+        val now = System.nanoTime()
+        if (now - lastTick < 120000000L) return
+        lastTick = now
+        val pm = if (total > 0) ((done * 1000L) / total).toInt().coerceIn(0, 1000) else -1
+        prog(stage, pm)
     }
 
-    fun run(
-        file1Name: String,
-        file2Name: String,
-        mapName: String,
-        file1Lines: List<String>,
-        file2Lines: List<String>,
-        mapLines: List<String>,
-        outName: String,
-        logName: String
-    ) {
-        val eq = "=".repeat(60)
-        val dash = "-".repeat(60)
-        val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+    private fun tmpWriter(f: File): BufferedWriter {
+        return BufferedWriter(OutputStreamWriter(FileOutputStream(f), Charsets.UTF_8), 1 shl 18)
+    }
 
-        p(eq)
-        p("LINE REPLACEMENT TOOL")
-        p(eq)
+    private fun wr(os: OutputStream, s: String) {
+        os.write(s.toByteArray(Charsets.UTF_8))
+    }
 
-        p("\n[1/5] Reading input files...")
-        p("  ✓ File1: ${file1Lines.size} lines loaded")
-        p("  ✓ File2: ${file2Lines.size} lines loaded")
-
-        p("\n[2/5] Parsing and validating map file...")
-        val replacements = ArrayList<Rep>()
-        val logEntries = ArrayList<String>()
-        val vrs = ArrayList<VR>()
-
-        var totalMappings = 0
-        for (l in mapLines) {
-            if (l.trim().isNotEmpty() && l.contains("=")) totalMappings++
+    private fun copyFile(f: File, os: OutputStream) {
+        val buf = ByteArray(1 shl 18)
+        FileInputStream(f).use { ins ->
+            while (true) {
+                val r = ins.read(buf)
+                if (r < 0) break
+                os.write(buf, 0, r)
+                chk()
+            }
         }
-        p("  ✓ Found $totalMappings mapping(s) to process")
+    }
 
-        var mappingNum = 0
-        var idx = 0
-        while (idx < mapLines.size) {
-            val lineNum = idx + 1
-            val line = mapLines[idx].trim()
-            idx++
-            if (line.isEmpty() || !line.contains("=")) continue
-
-            mappingNum++
-            val errors = ArrayList<String>()
-            val warnings = ArrayList<String>()
-
-            try {
-                val parts = line.split("=")
-                if (parts.size != 2) throw PyEx("too many values to unpack (expected 2)")
-                val left = parts[0]
-                val right = parts[1]
-
-                val leftPair: Pair<Int, Int> = if (left.contains(",")) {
-                    val lp = left.split(",")
-                    val a = pyInt(lp[0])
-                    val b = pyInt(lp[1])
-                    Pair(a, b)
-                } else {
-                    val x = pyInt(left)
-                    Pair(x, x)
-                }
-                val start1 = leftPair.first
-                val end1 = leftPair.second
-
-                if (start1 < 1 || end1 > file1Lines.size) {
-                    errors.add("File1 range $start1-$end1 is out of bounds (1-${file1Lines.size})")
-                }
-                if (start1 > end1) {
-                    errors.add("File1 range $start1-$end1 is invalid (start > end)")
-                }
-
-                val rightParts = ArrayList<Int>()
-                for (x in right.split(",")) rightParts.add(pyInt(x))
-
-                val file2Ranges = ArrayList<Pair<Int, Int>>()
+    // ---------- pass 1: count lines (and build sparse index for file2) ----------
+    private fun scan(which: Int, wantIdx: Boolean, total: Long): Scan {
+        val buf = ByteArray(1 shl 20)
+        var lines = 0L
+        var atStart = true
+        var prevCR = false
+        var pos = 0L
+        var k = 1
+        val idx = LongList()
+        env.openIn(which).use { ins ->
+            while (true) {
+                val n = ins.read(buf)
+                if (n < 0) break
+                chk()
                 var i = 0
-                while (i < rightParts.size) {
-                    if (i + 1 < rightParts.size) {
-                        file2Ranges.add(Pair(rightParts[i], rightParts[i + 1]))
-                        i += 2
-                    } else {
-                        file2Ranges.add(Pair(rightParts[i], rightParts[i]))
-                        i += 1
+                while (i < n) {
+                    val b = buf[i].toInt()
+                    if (prevCR) {
+                        prevCR = false
+                        if (b == 10) {
+                            i++
+                            continue
+                        }
                     }
+                    if (atStart) {
+                        lines++
+                        if (wantIdx && (lines - 1) % k == 0L) {
+                            idx.add(pos + i)
+                            if (idx.n >= 2000000) {
+                                val h = (idx.n + 1) / 2
+                                var q = 0
+                                while (q < h) {
+                                    idx.a[q] = idx.a[2 * q]
+                                    q++
+                                }
+                                idx.n = h
+                                k *= 2
+                            }
+                        }
+                        atStart = false
+                    }
+                    if (b == 10) {
+                        atStart = true
+                    } else if (b == 13) {
+                        atStart = true
+                        prevCR = true
+                    }
+                    i++
                 }
-
-                var ri = 0
-                while (ri < file2Ranges.size) {
-                    val s2 = file2Ranges[ri].first
-                    val e2 = file2Ranges[ri].second
-                    if (s2 < 1 || e2 > file2Lines.size) {
-                        errors.add("File2 range #${ri + 1} ($s2-$e2) is out of bounds (1-${file2Lines.size})")
-                    }
-                    if (s2 > e2) {
-                        errors.add("File2 range #${ri + 1} ($s2-$e2) is invalid (start > end)")
-                    }
-                    ri++
-                }
-
-                for (prev in replacements) {
-                    if (!(end1 < prev.start1 || start1 > prev.end1)) {
-                        warnings.add("Overlaps with previous mapping at file1 lines ${prev.start1}-${prev.end1}")
-                    }
-                }
-
-                val status = if (errors.isEmpty()) "✓ SUCCESS" else "✗ FAILED"
-
-                replacements.add(Rep(start1, end1, file2Ranges))
-
-                val file1Str = rangeStr(start1, end1)
-                val rangesList = ArrayList<String>()
-                for (pr in file2Ranges) rangesList.add(rangeStr(pr.first, pr.second))
-                val rangesStr = rangesList.joinToString(", ")
-
-                vrs.add(VR(mappingNum, lineNum, file1Str, rangesStr, status, errors, warnings))
-                logEntries.add("Map #$mappingNum: File1 lines $file1Str → File2 lines [$rangesStr]")
-            } catch (e: PyEx) {
-                errors.add("Parse error: ${e.message}")
-                vrs.add(VR(mappingNum, lineNum, "N/A", "N/A", "✗ FAILED", errors, ArrayList<String>()))
+                pos += n
+                val d = scanDone.addAndGet(n.toLong())
+                tick("Scanning input files", d, total)
             }
         }
+        if (lines > Int.MAX_VALUE) throw IOException("File has more than 2,147,483,647 lines (not supported)")
+        return Scan(lines.toInt(), idx, k)
+    }
 
-        // Validation results
-        p("\n[3/5] Validation Results:")
-        p(dash)
-        var successCount = 0
-        var failedCount = 0
-        for (r in vrs) {
-            p("  Map #${r.num} (line ${r.lineNum}): ${r.status}")
-            p("    File1: ${r.file1Range} → File2: [${r.file2Ranges}]")
-            if (r.errors.isNotEmpty()) {
-                failedCount++
-                for (er in r.errors) p("    ✗ ERROR: $er")
-            } else {
-                successCount++
+    // ---------- pass 2: parse the map file (streaming, no per-line objects) ----------
+    private fun tok(lb: ByteArray, a: Int, b: Int): Long {
+        var s = a
+        var e = b
+        while (s < e && (lb[s].toInt() and 0xFF) <= 32) s++
+        while (e > s && (lb[e - 1].toInt() and 0xFF) <= 32) e--
+        var neg = false
+        if (s < e) {
+            val c = lb[s].toInt()
+            if (c == 45 || c == 43) {
+                neg = (c == 45)
+                s++
             }
-            for (w in r.warnings) p("    ⚠ WARNING: $w")
-            p("")
         }
-        p("  Validation Summary: $successCount succeeded, $failedCount failed")
-
-        if (failedCount > 0) {
-            p("\n✗ Cannot proceed due to validation errors. Please fix the map file.")
-            p("  Check log file for details: $logName")
-            val lg = StringBuilder()
-            lg.append(eq).append("\n")
-            lg.append("LINE REPLACEMENT LOG - VALIDATION FAILED\n")
-            lg.append(eq).append("\n")
-            lg.append("Timestamp: $ts\n\n")
-            for (r in vrs) {
-                lg.append("Map #${r.num} (line ${r.lineNum}): ${r.status}\n")
-                lg.append("  File1: ${r.file1Range} → File2: [${r.file2Ranges}]\n")
-                for (er in r.errors) lg.append("  ✗ ERROR: $er\n")
-                for (w in r.warnings) lg.append("  ⚠ WARNING: $w\n")
-                lg.append("\n")
+        if (s >= e) {
+            tokOk = false
+            return 0L
+        }
+        var v = 0L
+        var i = s
+        while (i < e) {
+            val d = lb[i].toInt() - 48
+            if (d < 0 || d > 9) {
+                tokOk = false
+                return 0L
             }
-            writer(logName, lg.toString())
-            finish()
+            if (v < 100000000000000000L) v = v * 10 + d else v = 1000000000000000000L
+            i++
+        }
+        tokOk = true
+        return if (neg) -v else v
+    }
+
+    private fun badMsg(lb: ByteArray, a: Int, b: Int): String {
+        return "invalid literal for int() with base 10: '" + String(lb, a, b - a, Charsets.UTF_8) + "'"
+    }
+
+    private fun addParseFail(k: Int, errors: ArrayList<String>, msg: String) {
+        errors.add("Parse error: $msg")
+        mSt.add(0)
+        mEn.add(-1)
+        failedBits.set(k)
+        failedCount++
+        if (fails.size < 100000) fails[k] = FR("N/A", "N/A", errors)
+    }
+
+    private fun handleLine(lb: ByteArray, len: Int, lineNum: Int) {
+        var s = 0
+        var e = len
+        while (s < e && (lb[s].toInt() and 0xFF) <= 32) s++
+        while (e > s && (lb[e - 1].toInt() and 0xFF) <= 32) e--
+        if (s >= e) return
+        var eqPos = -1
+        var eqCount = 0
+        var i = s
+        while (i < e) {
+            if (lb[i].toInt() == 61) {
+                eqCount++
+                if (eqPos < 0) eqPos = i
+            }
+            i++
+        }
+        if (eqCount == 0) return
+
+        totalMappings++
+        val k = mSt.n
+        mLine.add(lineNum)
+        mRs.add(r2s.n)
+        val errors = ArrayList<String>()
+
+        if (eqCount > 1) {
+            addParseFail(k, errors, "too many values to unpack (expected 2)")
             return
         }
 
-        val sorted = replacements.sortedBy { it.start1 }
-
-        p("\n[4/5] Processing replacements...")
-        val outputLines = ArrayList<String>()
-        var current = 1
-        var repIndex = 0
-        val numFile1 = file1Lines.size
-        var processedCount = 0
-        var totalInserted = 0
-        val processing = ArrayList<PR>()
-
-        while (current <= numFile1) {
-            if (repIndex < sorted.size && current == sorted[repIndex].start1) {
-                val r = sorted[repIndex]
-                var inserted = 0
-                for (rg in r.ranges) {
-                    val chunk = file2Lines.subList(rg.first - 1, rg.second)
-                    outputLines.addAll(chunk)
-                    inserted += chunk.size
-                }
-                totalInserted += inserted
-                processedCount++
-                val file1Str = rangeStr(r.start1, r.end1)
-                p("  [$processedCount/${sorted.size}] ✓ Replaced file1 lines $file1Str with $inserted lines from file2")
-                processing.add(PR(processedCount, file1Str, inserted, "✓ SUCCESS"))
-                current = r.end1 + 1
-                repIndex++
+        // ----- left side -----
+        var comma = -1
+        var j = s
+        while (j < eqPos) {
+            if (lb[j].toInt() == 44) {
+                comma = j
+                break
+            }
+            j++
+        }
+        var start1 = 0L
+        var end1 = 0L
+        var bad: String? = null
+        if (comma >= 0) {
+            start1 = tok(lb, s, comma)
+            if (!tokOk) {
+                bad = badMsg(lb, s, comma)
             } else {
-                outputLines.add(file1Lines[current - 1])
-                current++
+                var c2 = comma + 1
+                while (c2 < eqPos && lb[c2].toInt() != 44) c2++
+                end1 = tok(lb, comma + 1, c2)
+                if (!tokOk) bad = badMsg(lb, comma + 1, c2)
+            }
+        } else {
+            start1 = tok(lb, s, eqPos)
+            if (!tokOk) bad = badMsg(lb, s, eqPos)
+            end1 = start1
+        }
+        if (bad != null) {
+            addParseFail(k, errors, bad)
+            return
+        }
+
+        if (start1 < 1 || end1 > l1) {
+            errors.add("File1 range $start1-$end1 is out of bounds (1-$l1)")
+        }
+        if (start1 > end1) {
+            errors.add("File1 range $start1-$end1 is invalid (start > end)")
+        }
+
+        // ----- right side -----
+        tmpN = 0
+        var a = eqPos + 1
+        while (true) {
+            var c = a
+            while (c < e && lb[c].toInt() != 44) c++
+            val v = tok(lb, a, c)
+            if (!tokOk) {
+                bad = badMsg(lb, a, c)
+                break
+            }
+            if (tmpN == tmpT.size) tmpT = tmpT.copyOf(tmpN * 2)
+            tmpT[tmpN] = v
+            tmpN++
+            if (c >= e) break
+            a = c + 1
+        }
+        if (bad != null) {
+            addParseFail(k, errors, bad)
+            return
+        }
+
+        val save = r2s.n
+        var pi = 0
+        var rn = 1
+        while (pi < tmpN) {
+            val x = tmpT[pi]
+            val y = if (pi + 1 < tmpN) tmpT[pi + 1] else x
+            if (x < 1 || y > l2) errors.add("File2 range #$rn ($x-$y) is out of bounds (1-$l2)")
+            if (x > y) errors.add("File2 range #$rn ($x-$y) is invalid (start > end)")
+            r2s.add(x.toInt())
+            r2e.add(y.toInt())
+            pi += 2
+            rn++
+        }
+
+        mSt.add(clampI(start1))
+        mEn.add(clampI(end1))
+
+        if (errors.isNotEmpty()) {
+            r2s.n = save
+            r2e.n = save
+            failedBits.set(k)
+            failedCount++
+            if (fails.size < 100000) {
+                val rb = StringBuilder()
+                var q = 0
+                while (q < tmpN) {
+                    val x = tmpT[q]
+                    val y = if (q + 1 < tmpN) tmpT[q + 1] else x
+                    if (rb.isNotEmpty()) rb.append(", ")
+                    rb.append(rangeStr(x, y))
+                    q += 2
+                }
+                fails[k] = FR(rangeStr(start1, end1), rb.toString(), errors)
             }
         }
-        p("  ✓ All $processedCount replacement(s) completed successfully")
+    }
 
-        p("\n[5/5] Writing output file...")
-        writer(outName, outputLines.joinToString(""))
-        p("  ✓ Output saved to: $outName")
-        p("  ✓ Total lines in output: ${outputLines.size}")
-
-        p("\n[6/6] Generating log file...")
-        val lg = StringBuilder()
-        lg.append(eq).append("\n")
-        lg.append("LINE REPLACEMENT LOG - SUCCESS\n")
-        lg.append(eq).append("\n")
-        lg.append("Timestamp: $ts\n\n")
-
-        lg.append("INPUT FILES:\n")
-        lg.append("  File1: $file1Name (${file1Lines.size} lines)\n")
-        lg.append("  File2: $file2Name (${file2Lines.size} lines)\n")
-        lg.append("  Map:   $mapName ($totalMappings mappings)\n\n")
-
-        lg.append("OUTPUT:\n")
-        lg.append("  Result: $outName (${outputLines.size} lines)\n\n")
-
-        lg.append("VALIDATION RESULTS:\n")
-        lg.append(dash).append("\n")
-        for (r in vrs) {
-            lg.append("Map #${r.num} (line ${r.lineNum}): ${r.status}\n")
-            lg.append("  File1: ${r.file1Range} → File2: [${r.file2Ranges}]\n")
-            for (er in r.errors) lg.append("  ✗ ERROR: $er\n")
-            for (w in r.warnings) lg.append("  ⚠ WARNING: $w\n")
-            lg.append("\n")
+    private fun parseMap(size: Long) {
+        val buf = ByteArray(1 shl 20)
+        var lb = ByteArray(1 shl 16)
+        var ln = 0
+        var lineNum = 0
+        var prevCR = false
+        var done = 0L
+        env.openIn(3).use { ins ->
+            while (true) {
+                val n = ins.read(buf)
+                if (n < 0) break
+                chk()
+                var i = 0
+                while (i < n) {
+                    val b = buf[i].toInt()
+                    i++
+                    if (prevCR) {
+                        prevCR = false
+                        if (b == 10) continue
+                    }
+                    if (b == 10 || b == 13) {
+                        lineNum++
+                        handleLine(lb, ln, lineNum)
+                        ln = 0
+                        if (b == 13) prevCR = true
+                    } else {
+                        if (ln == lb.size) lb = lb.copyOf(ln * 2)
+                        lb[ln] = b.toByte()
+                        ln++
+                    }
+                }
+                done += n
+                tick("Reading map file", done, size)
+            }
         }
-        lg.append("Summary: $successCount succeeded, $failedCount failed\n")
-        lg.append(dash).append("\n\n")
-
-        lg.append("PROCESSING RESULTS:\n")
-        lg.append(dash).append("\n")
-        for (r in processing) {
-            lg.append("Map #${r.num}: ${r.status}\n")
-            lg.append("  File1 range: ${r.file1Range}\n")
-            lg.append("  Lines inserted: ${r.inserted}\n\n")
+        if (ln > 0) {
+            lineNum++
+            handleLine(lb, ln, lineNum)
         }
-        lg.append(dash).append("\n\n")
+        mRs.add(r2s.n)
+    }
 
-        lg.append("REPLACEMENT SUMMARY:\n")
-        lg.append("  Total mappings processed: $processedCount\n")
-        lg.append("  Total lines inserted from file2: $totalInserted\n\n")
+    // ---------- sorting + overlap detection (no O(n^2)) ----------
+    private fun buildSorted(): LongArray {
+        val n = mSt.n
+        val keys = LongList()
+        var mono = true
+        var lastS = -1
+        var k = 0
+        while (k < n) {
+            val s = mSt[k]
+            if (s >= 1 && s <= mEn[k]) {
+                if (s < lastS) mono = false
+                lastS = s
+                keys.add((s.toLong() shl 32) or k.toLong())
+            }
+            k++
+        }
+        val sorted = keys.a.copyOf(keys.n)
+        if (!mono) java.util.Arrays.sort(sorted)
+        return sorted
+    }
 
-        lg.append("DETAILED MAPPINGS:\n")
-        lg.append(dash).append("\n")
-        for (en in logEntries) lg.append(en).append("\n")
-        lg.append(dash).append("\n")
+    private fun findOverlaps(sorted: LongArray): LongArray {
+        val act = IntList()
+        val pairs = LongList()
+        var q = 0
+        while (q < sorted.size) {
+            val k = (sorted[q] and MASK).toInt()
+            val s = mSt[k]
+            var w = 0
+            var r = 0
+            while (r < act.n) {
+                val i = act.a[r]
+                if (mEn[i] >= s) {
+                    act.a[w] = i
+                    w++
+                    if (pairs.n < 3000000) {
+                        val hi = if (i > k) i else k
+                        val lo = if (i > k) k else i
+                        pairs.add((hi.toLong() shl 32) or lo.toLong())
+                    }
+                }
+                r++
+            }
+            act.n = w
+            act.add(k)
+            if ((q and 0xFFFF) == 0) chk()
+            q++
+        }
+        val out = pairs.a.copyOf(pairs.n)
+        java.util.Arrays.sort(out)
+        return out
+    }
 
-        writer(logName, lg.toString())
-        p("  ✓ Log saved to: $logName")
+    // ---------- validation report: log temp files + short on-screen view ----------
+    private fun writeValidation(pairs: LongArray, vFile: File, dFile: File) {
+        val n = mSt.n
+        val vw = tmpWriter(vFile)
+        val dw = tmpWriter(dFile)
+        val showAll = n <= 200
+        var shown = 0
+        var hidden = 0
+        var pp = 0
+        val b = StringBuilder()
+        val rb = StringBuilder()
+        p("\n[3/5] Validation Results:")
+        p(dash)
+        if (!showAll) p("  (large map: only failed / warned entries are shown here; full results are in the log file)")
+        try {
+            var k = 0
+            while (k < n) {
+                val failed = failedBits.get(k)
+                val fr: FR? = if (failed) fails[k] else null
+                val f1: String
+                val f2: String
+                if (fr != null) {
+                    f1 = fr.f1
+                    f2 = fr.f2
+                } else if (failed) {
+                    f1 = "N/A"
+                    f2 = "N/A"
+                } else {
+                    f1 = rangeStr(mSt[k].toLong(), mEn[k].toLong())
+                    rb.setLength(0)
+                    var q = mRs[k]
+                    val qe = mRs[k + 1]
+                    while (q < qe) {
+                        if (rb.isNotEmpty()) rb.append(", ")
+                        rb.append(rangeStr(r2s[q].toLong(), r2e[q].toLong()))
+                        q++
+                    }
+                    f2 = rb.toString()
+                }
+                val hasWarn = pp < pairs.size && (pairs[pp] shr 32).toInt() == k
 
-        p("\n" + eq)
-        p("SUMMARY")
-        p(eq)
-        p("✓ Validated $successCount/$totalMappings mappings successfully")
-        p("✓ Processed $processedCount/$totalMappings mappings")
-        p("✓ Inserted $totalInserted lines from file2")
-        p("✓ Output file: ${outputLines.size} total lines")
-        p("✓ Log file: $logName")
-        p(eq)
-        p("\n✓ Replacement complete!")
-        finish()
+                b.setLength(0)
+                b.append("Map #").append(k + 1).append(" (line ").append(mLine[k]).append("): ")
+                b.append(if (failed) "✗ FAILED" else "✓ SUCCESS").append("\n")
+                b.append("  File1: ").append(f1).append(" → File2: [").append(f2).append("]\n")
+                if (fr != null) {
+                    for (er in fr.errors) b.append("  ✗ ERROR: ").append(er).append("\n")
+                } else if (failed) {
+                    b.append("  ✗ ERROR: (details omitted - more than 100000 failed mappings)\n")
+                }
+                while (pp < pairs.size && (pairs[pp] shr 32).toInt() == k) {
+                    val lo = (pairs[pp] and MASK).toInt()
+                    b.append("  ⚠ WARNING: Overlaps with previous mapping at file1 lines ")
+                    b.append(mSt[lo]).append("-").append(mEn[lo]).append("\n")
+                    pp++
+                }
+                b.append("\n")
+                vw.append(b)
+
+                if (fr == null) {
+                    if (!failed) {
+                        dw.append("Map #").append((k + 1).toString()).append(": File1 lines ").append(f1)
+                        dw.append(" → File2 lines [").append(f2).append("]\n")
+                    }
+                } else if (fr.f1 != "N/A") {
+                    dw.append("Map #").append((k + 1).toString()).append(": File1 lines ").append(f1)
+                    dw.append(" → File2 lines [").append(f2).append("]\n")
+                }
+
+                if (showAll || failed || hasWarn) {
+                    if (showAll || shown < 100) {
+                        shown++
+                        val txt = b.toString().trimEnd('\n')
+                        for (ln in txt.split("\n")) p("  $ln")
+                        p("")
+                    } else {
+                        hidden++
+                    }
+                }
+                if ((k and 0xFFF) == 0) {
+                    chk()
+                    tick("Checking map entries", k.toLong(), n.toLong())
+                }
+                k++
+            }
+        } finally {
+            vw.close()
+            dw.close()
+        }
+        if (hidden > 0) p("  ... $hidden more failed / warned entries not shown (see log file)")
+    }
+
+    // ---------- pass 3: stream file1 -> output, applying replacements ----------
+    private fun doProcess(sorted: LongArray, os: OutputStream, s2: Scan, size1: Long, pFile: File, st: Stats) {
+        val nrep = sorted.size
+        val ob = OutBuf(os)
+        var chn: FileChannel? = null
+        var rr: RR? = null
+        procTotal = size1
+        procDone = 0L
+        val pw = tmpWriter(pFile)
+        try {
+            if (r2s.n > 0) {
+                val c = env.openChannel()
+                chn = c
+                rr = RR(c, 0L, s2.idx, s2.k) { }
+            }
+            val buf = ByteArray(1 shl 20)
+            var line = 0
+            var atStart = true
+            var prevCR = false
+            var skipUntil = 0
+            var skipping = false
+            var ri = 0
+            var nextStart = if (nrep > 0) mSt[(sorted[0] and MASK).toInt()] else Int.MAX_VALUE
+            env.openIn(1).use { strm ->
+                while (true) {
+                    val n = strm.read(buf)
+                    if (n < 0) break
+                    chk()
+                    var i = 0
+                    while (i < n) {
+                        val b = buf[i].toInt()
+                        i++
+                        if (prevCR) {
+                            prevCR = false
+                            if (b == 10) continue
+                        }
+                        if (atStart) {
+                            line++
+                            atStart = false
+                            if (line > skipUntil && line == nextStart) {
+                                val kk = (sorted[ri] and MASK).toInt()
+                                var inserted = 0L
+                                var q = mRs[kk]
+                                val qe = mRs[kk + 1]
+                                val reader = rr ?: throw IllegalStateException("file2 reader missing")
+                                while (q < qe) {
+                                    val a2 = r2s[q]
+                                    val e2 = r2e[q]
+                                    reader.copy(a2, e2, ob)
+                                    inserted += (e2 - a2 + 1).toLong()
+                                    q++
+                                    chk()
+                                }
+                                st.inserted += inserted
+                                st.outLines += inserted
+                                st.processed++
+                                val f1s = rangeStr(mSt[kk].toLong(), mEn[kk].toLong())
+                                if (nrep <= 100 || st.processed <= 50) {
+                                    p("  [${st.processed}/$nrep] ✓ Replaced file1 lines $f1s with $inserted lines from file2")
+                                }
+                                pw.write("Map #${st.processed}: ✓ SUCCESS\n  File1 range: $f1s\n  Lines inserted: $inserted\n\n")
+                                skipUntil = mEn[kk]
+                                ri++
+                                nextStart = if (ri < nrep) mSt[(sorted[ri] and MASK).toInt()] else Int.MAX_VALUE
+                            }
+                            skipping = line <= skipUntil
+                            if (!skipping) st.outLines++
+                        }
+                        if (b == 10) {
+                            if (!skipping) ob.put(10)
+                            atStart = true
+                        } else if (b == 13) {
+                            if (!skipping) ob.put(10)
+                            atStart = true
+                            prevCR = true
+                        } else if (!skipping) {
+                            ob.put(b)
+                        }
+                    }
+                    procDone += n
+                    tick("Processing replacements", procDone, procTotal)
+                }
+            }
+            ob.flush()
+        } finally {
+            pw.close()
+            try {
+                chn?.close()
+            } catch (e: Exception) {
+            }
+        }
+        if (nrep > 100 && st.processed > 50) {
+            p("  ... ${st.processed - 50} more replacements not shown (see log file)")
+        }
+    }
+
+    // ---------- main flow ----------
+    fun run(file1Name: String, file2Name: String, mapName: String, outName: String, logName: String) {
+        val t0 = System.currentTimeMillis()
+        val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        val vFile = File(tmp, "lr_v.tmp")
+        val pFile = File(tmp, "lr_p.tmp")
+        val dFile = File(tmp, "lr_d.tmp")
+        try {
+            p(eq)
+            p("LINE REPLACEMENT TOOL")
+            p(eq)
+
+            p("\n[1/5] Reading input files...")
+            val size1 = env.size(1)
+            val size2 = env.size(2)
+            val sizeM = env.size(3)
+            val tot = if (size1 > 0 && size2 > 0) size1 + size2 else -1L
+            scanDone.set(0L)
+            val h = Holder()
+            val th = Thread {
+                try {
+                    h.v = scan(2, true, tot)
+                } catch (e: Throwable) {
+                    h.err = e
+                }
+            }
+            th.start()
+            val s1 = try {
+                scan(1, false, tot)
+            } catch (e: Throwable) {
+                cancel = true
+                th.join()
+                throw e
+            }
+            th.join()
+            val he = h.err
+            if (he != null) throw he
+            val s2 = h.v ?: throw IllegalStateException("Scan of file 2 failed")
+            l1 = s1.lines
+            l2 = s2.lines
+            p("  ✓ File1: $l1 lines loaded")
+            p("  ✓ File2: $l2 lines loaded")
+
+            p("\n[2/5] Parsing and validating map file...")
+            parseMap(sizeM)
+            p("  ✓ Found $totalMappings mapping(s) to process")
+
+            val sorted = buildSorted()
+            val pairs = findOverlaps(sorted)
+            writeValidation(pairs, vFile, dFile)
+            val successCount = totalMappings - failedCount
+            p("  Validation Summary: $successCount succeeded, $failedCount failed")
+
+            if (failedCount > 0) {
+                p("\n✗ Cannot proceed due to validation errors. Please fix the map file.")
+                p("  Check log file for details: $logName")
+                val lo = env.openOut(logName)
+                try {
+                    wr(lo, eq + "\nLINE REPLACEMENT LOG - VALIDATION FAILED\n" + eq + "\nTimestamp: $ts\n\n")
+                    copyFile(vFile, lo)
+                } finally {
+                    lo.close()
+                }
+                return
+            }
+
+            p("\n[4/5] Processing replacements...")
+            val st = Stats()
+            val os = env.openOut(outName)
+            var okOut = false
+            try {
+                doProcess(sorted, os, s2, size1, pFile, st)
+                okOut = true
+            } finally {
+                try {
+                    os.close()
+                } catch (e: Exception) {
+                }
+                if (!okOut) {
+                    try {
+                        env.discard(outName)
+                    } catch (e: Exception) {
+                    }
+                }
+            }
+            p("  ✓ All ${st.processed} replacement(s) completed successfully")
+
+            p("\n[5/5] Writing output file...")
+            p("  ✓ Output saved to: $outName")
+            p("  ✓ Total lines in output: ${st.outLines}")
+
+            p("\n[6/6] Generating log file...")
+            tick("Writing log file", 0L, 0L)
+            val lo = env.openOut(logName)
+            try {
+                val hd = StringBuilder()
+                hd.append(eq).append("\nLINE REPLACEMENT LOG - SUCCESS\n").append(eq).append("\n")
+                hd.append("Timestamp: $ts\n\n")
+                hd.append("INPUT FILES:\n")
+                hd.append("  File1: $file1Name ($l1 lines)\n")
+                hd.append("  File2: $file2Name ($l2 lines)\n")
+                hd.append("  Map:   $mapName ($totalMappings mappings)\n\n")
+                hd.append("OUTPUT:\n")
+                hd.append("  Result: $outName (${st.outLines} lines)\n\n")
+                hd.append("VALIDATION RESULTS:\n").append(dash).append("\n")
+                wr(lo, hd.toString())
+                copyFile(vFile, lo)
+                wr(lo, "Summary: $successCount succeeded, $failedCount failed\n" + dash + "\n\n")
+                wr(lo, "PROCESSING RESULTS:\n" + dash + "\n")
+                copyFile(pFile, lo)
+                wr(lo, dash + "\n\n")
+                wr(lo, "REPLACEMENT SUMMARY:\n")
+                wr(lo, "  Total mappings processed: ${st.processed}\n")
+                wr(lo, "  Total lines inserted from file2: ${st.inserted}\n\n")
+                wr(lo, "DETAILED MAPPINGS:\n" + dash + "\n")
+                copyFile(dFile, lo)
+                wr(lo, dash + "\n")
+            } finally {
+                lo.close()
+            }
+            p("  ✓ Log saved to: $logName")
+
+            p("\n" + eq)
+            p("SUMMARY")
+            p(eq)
+            p("✓ Validated $successCount/$totalMappings mappings successfully")
+            p("✓ Processed ${st.processed}/$totalMappings mappings")
+            p("✓ Inserted ${st.inserted} lines from file2")
+            p("✓ Output file: ${st.outLines} total lines")
+            p("✓ Log file: $logName")
+            p(eq)
+            val secs = (System.currentTimeMillis() - t0) / 1000.0
+            p("  Time taken: " + String.format(Locale.US, "%.1f", secs) + " s")
+            p("\n✓ Replacement complete!")
+        } finally {
+            fl()
+            vFile.delete()
+            pFile.delete()
+            dFile.delete()
+        }
     }
 }
 
-// ---------------------------------------------------------------
+// ===============================================================
 // Activity (UI built in code, framework Views only)
-// ---------------------------------------------------------------
+// ===============================================================
 @Suppress("DEPRECATION")
 class MainActivity : Activity() {
 
@@ -374,12 +944,16 @@ class MainActivity : Activity() {
     private lateinit var logTv: TextView
     private lateinit var logScroll: ScrollView
     private lateinit var runBtn: Button
+    private lateinit var progBar: ProgressBar
+    private lateinit var progTv: TextView
 
     private var uri1: Uri? = null
     private var uri2: Uri? = null
     private var uriMap: Uri? = null
     private var uriOut: Uri? = null
     private var running: Boolean = false
+    private var curEngine: Engine? = null
+    private var pfdKeep: ParcelFileDescriptor? = null
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -422,8 +996,21 @@ class MainActivity : Activity() {
         row3.orientation = LinearLayout.HORIZONTAL
         runBtn = mkBtn("RUN") { startRun() }
         row3.addView(runBtn)
+        row3.addView(mkBtn("Stop") { curEngine?.cancel = true })
         row3.addView(mkBtn("Clear log") { logTv.text = "" })
         root.addView(row3)
+
+        progBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        progBar.max = 1000
+        root.addView(
+            progBar,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
+        progTv = TextView(this)
+        progTv.setTextColor(Color.parseColor("#FFE082"))
+        progTv.textSize = 12f
+        progTv.setPadding(dp(4), 0, dp(4), dp(4))
+        root.addView(progTv)
 
         logScroll = ScrollView(this)
         logScroll.setBackgroundColor(Color.BLACK)
@@ -513,6 +1100,20 @@ class MainActivity : Activity() {
         return u.lastPathSegment ?: u.toString()
     }
 
+    private fun sizeOf(u: Uri): Long {
+        try {
+            val c = contentResolver.query(u, arrayOf(OpenableColumns.SIZE), null, null, null)
+            if (c != null) {
+                c.use {
+                    if (it.moveToFirst() && !it.isNull(0)) return it.getLong(0)
+                }
+            }
+        } catch (e: Exception) {
+            // ignore
+        }
+        return -1L
+    }
+
     private fun refreshStatus() {
         statusTv.text = "File 1:   " + nameOf(uri1) + "\n" +
             "File 2:   " + nameOf(uri2) + "\n" +
@@ -573,30 +1174,41 @@ class MainActivity : Activity() {
                 KeyEvent.KEYCODE_3 -> { pickFile(REQ_MAP); return true }
                 KeyEvent.KEYCODE_O -> { pickFolder(); return true }
                 KeyEvent.KEYCODE_R, KeyEvent.KEYCODE_ENTER -> { startRun(); return true }
+                KeyEvent.KEYCODE_PERIOD -> { curEngine?.cancel = true; return true }
             }
         }
         return super.dispatchKeyEvent(event)
     }
 
-    // ---------------- running ----------------
+    // ---------------- UI callbacks from the worker thread ----------------
     private fun appendLog(t: String) {
         runOnUiThread {
+            if (logTv.length() > 200000) {
+                logTv.text = logTv.text.toString().takeLast(100000)
+            }
             logTv.append(t)
-            logScroll.post { logScroll.fullScroll(android.view.View.FOCUS_DOWN) }
+            logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
         }
     }
 
-    private fun readText(u: Uri): String {
-        val ins = contentResolver.openInputStream(u) ?: throw IOException("Cannot open " + nameOf(u))
-        val bytes = ins.use { it.readBytes() }
-        return String(bytes, Charsets.UTF_8)
+    private fun setProgress(stage: String, pm: Int) {
+        runOnUiThread {
+            if (pm < 0) {
+                progBar.isIndeterminate = true
+                progTv.text = "$stage..."
+            } else {
+                progBar.isIndeterminate = false
+                progBar.progress = pm
+                progTv.text = stage + "... " + (pm / 10) + "." + (pm % 10) + "%"
+            }
+        }
     }
 
-    private fun writeDoc(tree: Uri, name: String, content: String) {
+    // ---------------- SAF output helpers ----------------
+    private fun findDocIds(tree: Uri, name: String): ArrayList<String> {
         val docId = DocumentsContract.getTreeDocumentId(tree)
-        val parent = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
         val kids = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId)
-        val toDelete = ArrayList<String>()
+        val res = ArrayList<String>()
         val c = contentResolver.query(
             kids,
             arrayOf(
@@ -608,11 +1220,15 @@ class MainActivity : Activity() {
         if (c != null) {
             c.use {
                 while (it.moveToNext()) {
-                    if (it.getString(1) == name) toDelete.add(it.getString(0))
+                    if (it.getString(1) == name) res.add(it.getString(0))
                 }
             }
         }
-        for (id in toDelete) {
+        return res
+    }
+
+    private fun deleteDocs(tree: Uri, name: String) {
+        for (id in findDocIds(tree, name)) {
             try {
                 DocumentsContract.deleteDocument(
                     contentResolver,
@@ -622,13 +1238,69 @@ class MainActivity : Activity() {
                 // ignore
             }
         }
-        val doc = DocumentsContract.createDocument(contentResolver, parent, "text/plain", name)
-            ?: throw IOException("Could not create $name")
-        val os = contentResolver.openOutputStream(doc, "wt")
-            ?: throw IOException("Could not write $name")
-        os.use { it.write(content.toByteArray(Charsets.UTF_8)) }
     }
 
+    private fun openDocOut(tree: Uri, name: String): OutputStream {
+        deleteDocs(tree, name)
+        val docId = DocumentsContract.getTreeDocumentId(tree)
+        val parent = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
+        val doc = DocumentsContract.createDocument(contentResolver, parent, "text/plain", name)
+            ?: throw IOException("Could not create $name")
+        return contentResolver.openOutputStream(doc, "wt")
+            ?: throw IOException("Could not write $name")
+    }
+
+    private fun makeEnv(a: Uri, b: Uri, m: Uri, o: Uri): Env {
+        return object : Env {
+            override fun openIn(which: Int): InputStream {
+                val u: Uri = if (which == 1) a else if (which == 2) b else m
+                return contentResolver.openInputStream(u) ?: throw IOException("Cannot open " + nameOf(u))
+            }
+
+            override fun size(which: Int): Long {
+                val u: Uri = if (which == 1) a else if (which == 2) b else m
+                return sizeOf(u)
+            }
+
+            override fun openChannel(): FileChannel {
+                try {
+                    val pfd = contentResolver.openFileDescriptor(b, "r")
+                    if (pfd != null) {
+                        val ch = FileInputStream(pfd.fileDescriptor).channel
+                        ch.read(ByteBuffer.allocate(1), 0L)
+                        pfdKeep = pfd
+                        return ch
+                    }
+                } catch (e: Exception) {
+                    // fall back to a cached copy below
+                }
+                val f = File(cacheDir, "file2.cache")
+                val ins = contentResolver.openInputStream(b) ?: throw IOException("Cannot open file 2")
+                ins.use { src ->
+                    FileOutputStream(f).use { dst -> src.copyTo(dst, 1 shl 20) }
+                }
+                return RandomAccessFile(f, "r").channel
+            }
+
+            override fun openOut(name: String): OutputStream = openDocOut(o, name)
+
+            override fun discard(name: String) {
+                deleteDocs(o, name)
+            }
+
+            override fun release() {
+                try {
+                    pfdKeep?.close()
+                } catch (e: Exception) {
+                    // ignore
+                }
+                pfdKeep = null
+                File(cacheDir, "file2.cache").delete()
+            }
+        }
+    }
+
+    // ---------------- running ----------------
     private fun startRun() {
         if (running) return
         val a = uri1
@@ -642,26 +1314,34 @@ class MainActivity : Activity() {
         running = true
         runBtn.isEnabled = false
         logTv.text = ""
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val n1 = nameOf(a)
         val n2 = nameOf(b)
         val nm = nameOf(m)
 
         Thread {
+            val env = makeEnv(a, b, m, o)
+            val eng = Engine(env, cacheDir, { t -> appendLog(t) }, { st, pm -> setProgress(st, pm) })
+            curEngine = eng
             try {
-                val l1 = splitLines(readText(a))
-                val l2 = splitLines(readText(b))
-                val lm = splitLines(readText(m))
-                val engine = Engine(
-                    { t -> appendLog(t) },
-                    { name, content -> writeDoc(o, name, content) }
-                )
-                engine.run(n1, n2, nm, l1, l2, lm, "result.txt", "replacement_log.txt")
-            } catch (e: Exception) {
+                eng.run(n1, n2, nm, "result.txt", "replacement_log.txt")
+            } catch (e: CancelEx) {
+                appendLog("\n✗ Stopped by user. Partial output was removed.\n")
+            } catch (e: OutOfMemoryError) {
+                appendLog("\n✗ ERROR: Out of memory (map file is extremely large).\n")
+            } catch (e: Throwable) {
                 appendLog("\n✗ ERROR: " + (e.message ?: e.toString()) + "\n")
+            } finally {
+                env.release()
+                curEngine = null
             }
             runOnUiThread {
                 running = false
                 runBtn.isEnabled = true
+                progBar.isIndeterminate = false
+                progBar.progress = 0
+                progTv.text = ""
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
         }.start()
     }
